@@ -3,22 +3,32 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 API = "https://api.github.com"
 MAX_REPO_KB = 50000
 MAX_SCANS_PER_USER_24H = 5
+MAX_REPOSITORY_INPUT_LENGTH = 2048
 TITLE_PREFIX = "[CostDoctor Scan]"
 URL_HEADING = "### GitHub 저장소 주소"
 LANG_HEADING = "### 결과 언어 / Result language"
 CONFIRM_TEXT = "이 저장소가 공개 저장소이며 진단 결과가 공개 GitHub 이슈에 표시되는 것에 동의합니다."
-SUPPORTED_LANGUAGES = {"한국어": "ko", "English": "en"}
+CONFIRM_TEXT_EN = "I confirm that this is a public repository and that the scan result will be posted to a public GitHub Issue."
+SUPPORTED_LANGUAGES = {
+    "english": "en",
+    "en": "en",
+    "한국어": "ko",
+    "korean": "ko",
+    "ko": "ko",
+}
 RECEIPT_SCHEMA = "costdoctor.public-scan-receipt.v2"
 
 
@@ -52,7 +62,13 @@ def extract_field(body, heading):
 
 
 def normalize_repo(value):
+    if not isinstance(value, str):
+        raise ValueError("URL_INVALID")
     raw = value.strip()
+    if not raw or len(raw) > MAX_REPOSITORY_INPUT_LENGTH:
+        raise ValueError("URL_INVALID")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+        raise ValueError("URL_INVALID")
     if "://" not in raw and raw.startswith("github.com/"):
         raw = "https://" + raw
     parsed = urllib.parse.urlparse(raw)
@@ -62,6 +78,8 @@ def normalize_repo(value):
         raise ValueError("URL_INVALID")
     parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
     if len(parts) < 2:
+        raise ValueError("URL_INVALID")
+    if any(part in {".", ".."} for part in parts):
         raise ValueError("URL_INVALID")
     owner, repo = parts[0], parts[1]
     if repo.endswith(".git"):
@@ -78,16 +96,28 @@ def parse_language(body):
     try:
         value = extract_field(body, LANG_HEADING)
     except ValueError:
-        return "ko"
-    return SUPPORTED_LANGUAGES.get(value, "ko")
+        return "en"
+    normalized = str(value).strip().casefold()
+    return SUPPORTED_LANGUAGES.get(normalized, "en")
 
 
 def confirmation_present(body):
-    return f"- [x] {CONFIRM_TEXT}" in body or f"- [X] {CONFIRM_TEXT}" in body
+    return any(
+        f"- [{mark}] {text}" in body
+        for mark in ("x", "X")
+        for text in (CONFIRM_TEXT, CONFIRM_TEXT_EN)
+    )
 
 
 def post_comment(repository, issue_number, token, text):
-    api("POST", f"{API}/repos/{repository}/issues/{issue_number}/comments", token, {"body": text[:60000]})
+    return api("POST", f"{API}/repos/{repository}/issues/{issue_number}/comments", token, {"body": text[:60000]})
+
+
+def update_comment(repository, comment_id, token, text):
+    """Replace the in-progress bot status so a scan leaves one result comment."""
+    if not comment_id:
+        return None
+    return api("PATCH", f"{API}/repos/{repository}/issues/comments/{int(comment_id)}", token, {"body": text[:60000]})
 
 
 def close_issue(repository, issue_number, token):
@@ -208,6 +238,79 @@ def load_report(result_dir):
     return json.loads(report_json.read_text(encoding="utf-8"))
 
 
+def run_universal_stage2(workspace, target_dir, static_result_dir, target_repo, target_ref, runner_temp, issue_number, language="ko"):
+    """Reuse the public-scan checkout for a secretless Universal Stage 2 pass.
+
+    This path never calls a provider.  It binds the same target snapshot and
+    static report, then asks the existing Stage 2 scripts for a sanitized
+    structural diagnosis.  A tiny empty acceptance envelope keeps the public
+    free path independent from the private/provider fixture benchmark.
+    """
+    stage2_root = runner_temp / f"costdoctor-stage2-{issue_number}"
+    if stage2_root.exists():
+        raise RuntimeError("TEMP_PATH_EXISTS")
+    stage2_root.mkdir(mode=0o700, parents=False)
+    binding_path = stage2_root / "target-binding.json"
+    preflight_path = stage2_root / "provider-preflight.json"
+    optimizer_dir = stage2_root / "optimizer-reference"
+    optimizer_dir.mkdir(mode=0o700)
+    (optimizer_dir / "acceptance.json").write_text(
+        json.dumps({"schema": "costdoctor.public-scan.stage2-reference.v1", "local_verdict": "PASS", "workloads": []}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    report_dir = stage2_root / "report"
+    scripts = workspace / "universal" / "scripts"
+    run(
+        [
+            sys.executable,
+            str(scripts / "run_target_bound_precheck.py"),
+            "--repository", str(target_dir),
+            "--target-repository", target_repo,
+            "--target-ref", target_ref,
+            "--static-report", str(static_result_dir / "report.json"),
+            "--output", str(binding_path),
+        ],
+        timeout=120,
+    )
+    run(
+        [
+            sys.executable,
+            str(scripts / "run_universal_provider_preflight.py"),
+            "--target-binding", str(binding_path),
+            "--output", str(preflight_path),
+            "--approved-max-spend-usd", "0",
+        ],
+        timeout=60,
+    )
+    run(
+        [
+            sys.executable,
+            str(scripts / "build_public_verified_savings_report.py"),
+            "--static-report", str(static_result_dir / "report.json"),
+            "--optimizer-dir", str(optimizer_dir),
+            "--provider-preflight", str(preflight_path),
+            "--target-binding", str(binding_path),
+            "--target-precheck", str(binding_path),
+            "--language", language,
+            "--output", str(report_dir),
+        ],
+        timeout=120,
+    )
+    independent_path = stage2_root / "independent-public-stage2.json"
+    run(
+        [
+            sys.executable,
+            str(scripts / "independent_validate_public_stage2.py"),
+            "--binding", str(binding_path),
+            "--preflight", str(preflight_path),
+            "--report", str(report_dir / "verified_savings_report.json"),
+            "--output", str(independent_path),
+        ],
+        timeout=60,
+    )
+    return report_dir, binding_path, preflight_path, independent_path
+
+
 def top_findings(report, limit=4):
     findings = list(report.get("findings") or [])
     findings.sort(key=lambda x: int(x.get("signal_count") or 0), reverse=True)
@@ -223,7 +326,36 @@ def safe_tool_sha(value):
     return value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40}", value) else "UNKNOWN"
 
 
-def build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, generated_at=None):
+def classify_usage_evidence(repository, actor, actor_type, outcome="PUBLIC_SCAN_SUCCESS"):
+    """Return aggregate-only usage categories without persisting actor identity."""
+    owner = str(repository or "").split("/", 1)[0].strip().casefold()
+    login = str(actor or "").strip().casefold()
+    if not login:
+        request_category = "ANONYMOUS_PUBLIC_REQUEST"
+    elif actor_type.lower() == "bot" or login.endswith("[bot]"):
+        request_category = "AUTOMATION_REJECTED"
+    elif owner and login == owner:
+        request_category = "OWNER_TEST"
+    else:
+        request_category = "CONFIRMED_EXTERNAL_ACTOR"
+    return {
+        "request_category": request_category,
+        "outcome_category": outcome,
+        "funnel": {
+            "request_received": True,
+            "validation_pass": outcome not in {"PUBLIC_SCAN_FAILURE", "INPUT_REJECTED"},
+            "dispatch_pass": outcome not in {"PUBLIC_SCAN_FAILURE", "INPUT_REJECTED"},
+            "scan_pass": outcome == "PUBLIC_SCAN_SUCCESS",
+            "result_pass": outcome == "PUBLIC_SCAN_SUCCESS",
+        },
+        "request_id": uuid.uuid4().hex,
+        "identity_persisted": False,
+        "ip_persisted": False,
+        "source_persisted": False,
+    }
+
+
+def build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, generated_at=None, stage2_status="PENDING", stage2_trust_level="UNKNOWN", usage_evidence=None):
     coverage = report.get("coverage") or {}
     findings = [
         {"rule": f.get("rule"), "signal_count": int(f.get("signal_count") or 0)}
@@ -246,9 +378,27 @@ def build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, gener
             "analyzed_bytes": int(coverage.get("analyzed_bytes") or 0),
             "findings": findings,
             "scanner_report_sha256": canonical_sha256(report),
+            "stage2_status": stage2_status,
+            "stage2_trust_level": stage2_trust_level,
         },
+        # Keep the tool revision and the scanned target revision separate.
+        # The target HEAD comes from the API-verified metadata and the actual
+        # checkout readback; it is never inferred from the tool SHA.
+        "tool_repository": os.environ.get("GITHUB_REPOSITORY", "UNKNOWN"),
+        "tool_commit": safe_tool_sha(tool_sha),
+        "target_repository": target_repo,
+        "target_commit": meta.get("head"),
         "costdoctor": {"head": safe_tool_sha(tool_sha)},
         "run": {"issue_url": issue_url, "actions_run_url": run_url},
+        "usage_evidence": usage_evidence or {
+            "request_category": "ANONYMOUS_PUBLIC_REQUEST",
+            "outcome_category": "PUBLIC_SCAN_SUCCESS",
+            "funnel": {},
+            "request_id": "NOT_RECORDED",
+            "identity_persisted": False,
+            "ip_persisted": False,
+            "source_persisted": False,
+        },
         "claims": {
             "static_review_signals_only": True,
             "actual_calls_measured": False,
@@ -270,6 +420,8 @@ def build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, gener
 
 def format_result(report, target_repo, meta, lang, issue_url, run_url, receipt=None):
     verdict = report.get("verdict", "UNKNOWN")
+    friendly_status = {"SCAN_COMPLETE": "Complete (static precheck)", "PARTIAL_SCAN": "Partial scan", "NO_SUPPORTED_SOURCE": "No supported source"}.get(verdict, "Not completed")
+    friendly_status_ko = {"SCAN_COMPLETE": "완료(정적 사전검사)", "PARTIAL_SCAN": "부분 검사", "NO_SUPPORTED_SOURCE": "분석 가능한 소스 없음"}.get(verdict, "완료되지 않음")
     coverage = report.get("coverage") or {}
     analyzed_files = int(coverage.get("analyzed_files") or 0)
     analyzed_bytes = int(coverage.get("analyzed_bytes") or 0)
@@ -292,7 +444,7 @@ def format_result(report, target_repo, meta, lang, issue_url, run_url, receipt=N
         return f"""## CostDoctor free public repository scan
 
 **Repository:** `{target_repo}`  
-**Status:** `{verdict}`  
+**Status:** **{friendly_status}**
 **Primary language reported by GitHub:** `{meta['language']}`  
 **Scanned:** {analyzed_files} files / {analyzed_bytes} bytes  
 **Snapshot:** exact default-branch HEAD verified against the GitHub API before analysis.{receipt_line_en}
@@ -320,7 +472,7 @@ Measure one high-signal path with the same goal/input/model/quality criteria bef
     return f"""## CostDoctor 무료 공개 저장소 진단 결과
 
 **대상:** `{target_repo}`  
-**상태:** `{verdict}`  
+**상태:** **{friendly_status_ko}**
 **GitHub 표시 주 언어:** `{meta['language']}`  
 **검사:** {analyzed_files}개 파일 / {analyzed_bytes} bytes  
 **스냅샷:** 분석 직전 GitHub API의 기본 브랜치 HEAD와 실제 checkout HEAD 일치를 확인했습니다.{receipt_line_ko}
@@ -343,13 +495,17 @@ Measure one high-signal path with the same goal/input/model/quality criteria bef
 """
 
 
-def write_public_output(output_dir, markdown, receipt):
+def write_public_output(output_dir, markdown, receipt, stage2_sources=None):
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise RuntimeError("PUBLIC_OUTPUT_EXISTS")
     output_dir.mkdir(mode=0o700, parents=False)
     (output_dir / "result.md").write_text(markdown, encoding="utf-8")
     (output_dir / "receipt.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    for source, name in (stage2_sources or []):
+        source = Path(source)
+        if source.is_file() and source.name in {"verified_savings_report.json", "verified_savings_report.md", "target-binding.json", "provider-preflight.json", "independent-public-stage2.json"}:
+            shutil.copyfile(source, output_dir / name)
 
 
 def append_runner_file(env_name, text):
@@ -428,6 +584,8 @@ def main():
 
     lang = parse_language(body)
     target_repo = None
+    status_comment_id = None
+    usage_evidence = classify_usage_evidence(repository, actor, actor_type, "PUBLIC_SCAN_SUCCESS")
     try:
         if actor_type.lower() == "bot" or actor.endswith("[bot]"):
             raise ValueError("BOT_NOT_ALLOWED")
@@ -442,7 +600,8 @@ def main():
             if lang == "ko"
             else f"CostDoctor started a safe static scan of public repository `{target_repo}`. Target-project code will not be executed."
         )
-        post_comment(repository, issue_number, token, started)
+        status_comment = post_comment(repository, issue_number, token, started)
+        status_comment_id = (status_comment or {}).get("id") if isinstance(status_comment, dict) else None
 
         target_dir = runner_temp / f"costdoctor-target-{issue_number}"
         result_dir = runner_temp / f"costdoctor-result-{issue_number}"
@@ -458,15 +617,60 @@ def main():
             timeout=120
         )
         report = load_report(result_dir)
-        receipt = build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha)
+        receipt = build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, usage_evidence=usage_evidence)
         markdown = format_result(report, target_repo, meta, lang, issue_url, run_url, receipt=receipt)
-        write_public_output(public_output_dir, markdown, receipt)
+        stage2_sources = []
+        try:
+            stage2_dir, binding_path, preflight_path, independent_path = run_universal_stage2(
+                workspace, target_dir, result_dir, target_repo, meta["default_branch"], runner_temp, issue_number, lang
+            )
+            stage2_markdown_path = stage2_dir / "verified_savings_report.md"
+            stage2_json_path = stage2_dir / "verified_savings_report.json"
+            stage2_payload = json.loads(stage2_json_path.read_text(encoding="utf-8"))
+            receipt = build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, stage2_status="COMPLETE_STAGE2", stage2_trust_level=stage2_payload.get("trust_level", "UNKNOWN"), usage_evidence=usage_evidence)
+            stage2_markdown = stage2_markdown_path.read_text(encoding="utf-8")
+            # Stage 2 is the single integrated user report.  It carries the
+            # Stage 1 canonical signal table and the interpretation, so the
+            # earlier verbose static block is not repeated in the comment.
+            receipt_line = (
+                f"\n\n---\n\n검증 영수증: `{receipt['receipt_sha256'][:16]}` · "
+                f"[진단 요청]({issue_url}) · [Actions 실행 기록]({run_url})"
+                if lang != "en"
+                else f"\n\n---\n\nReceipt: `{receipt['receipt_sha256'][:16]}` · "
+                f"[Scan request]({issue_url}) · [GitHub Actions run]({run_url})"
+            )
+            markdown = stage2_markdown + receipt_line
+            stage2_sources = [
+                (stage2_markdown_path, "stage2_verified_savings_report.md"),
+                (stage2_json_path, "stage2_verified_savings_report.json"),
+                (binding_path, "stage2_target_binding.json"),
+                (preflight_path, "stage2_provider_preflight.json"),
+                (independent_path, "stage2_independent_validation.json"),
+            ]
+        except Exception:
+            # Preserve the established static result if the optional Stage 2
+            # subprocess cannot complete; never fabricate a savings claim.
+            fallback = (
+                "## CostDoctor Stage 2\n\n**상태:** `STAGE2_UNAVAILABLE`\n\n"
+                "이번 실행에서 범용 Stage 2 진단을 완료하지 못했습니다. 실제 비용·절감률은 검증되지 않았습니다."
+                if lang != "en"
+                else "## CostDoctor Stage 2\n\n**Status:** `STAGE2_UNAVAILABLE`\n\nUniversal Stage 2 could not complete in this run. Actual cost and savings remain unverified."
+            )
+            usage_evidence["outcome_category"] = "PUBLIC_SCAN_FAILURE"
+            usage_evidence["funnel"]["scan_pass"] = False
+            usage_evidence["funnel"]["result_pass"] = False
+            receipt = build_receipt(report, target_repo, meta, issue_url, run_url, tool_sha, stage2_status="PARTIAL_STAGE1_ONLY", stage2_trust_level="UNKNOWN", usage_evidence=usage_evidence)
+            markdown = markdown + "\n\n---\n\n" + fallback
+        write_public_output(public_output_dir, markdown, receipt, stage2_sources)
         append_runner_file("GITHUB_STEP_SUMMARY", markdown + "\n")
         append_runner_file(
             "GITHUB_OUTPUT",
             f"public-output-dir={public_output_dir}\nreceipt-sha256={receipt['receipt_sha256']}\n"
         )
-        post_comment(repository, issue_number, token, markdown)
+        if status_comment_id:
+            update_comment(repository, status_comment_id, token, markdown)
+        else:
+            post_comment(repository, issue_number, token, markdown)
         close_and_lock(repository, issue_number, token)
         return 0
 
@@ -481,8 +685,17 @@ def main():
     except Exception as e:
         code = str(e) if re.fullmatch(r"[A-Z0-9_]+", str(e)) else "INTERNAL_ERROR"
 
+    usage_evidence["outcome_category"] = "PUBLIC_SCAN_FAILURE"
+    usage_evidence["funnel"]["validation_pass"] = False
+    usage_evidence["funnel"]["dispatch_pass"] = False
+    usage_evidence["funnel"]["scan_pass"] = False
+    usage_evidence["funnel"]["result_pass"] = False
     try:
-        post_comment(repository, issue_number, token, friendly_error(code, lang, retry_url))
+        error_markdown = friendly_error(code, lang, retry_url)
+        if status_comment_id:
+            update_comment(repository, status_comment_id, token, error_markdown)
+        else:
+            post_comment(repository, issue_number, token, error_markdown)
         close_and_lock(repository, issue_number, token)
     except Exception:
         pass

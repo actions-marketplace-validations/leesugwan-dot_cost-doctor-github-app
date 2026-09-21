@@ -1,0 +1,156 @@
+name: CostDoctor public verified savings
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: "분석할 대상 저장소(owner/repo)"
+        required: true
+      target_ref:
+        description: "대상 저장소 기준 ref"
+        required: true
+        default: "main"
+      approved_max_spend_usd:
+        description: "최대 허용 지출(USD, 하드캡 0.05 이하)"
+        required: true
+        default: "0.04"
+      execute_confirmation:
+        description: "실제 Provider 호출 시 PROVIDER_PAID_EXECUTION_APPROVED 입력"
+        required: false
+        default: ""
+      provider_secret_name:
+        description: "선택: 대상 저장소의 Provider Secret 이름(비우면 Stage 2 구조진단만 수행)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: costdoctor-public-verified-savings-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verified-savings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout CostDoctor engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: costdoctor-engine
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+
+      - name: Checkout target repository (runner-local read-only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.target_repository }}
+          ref: ${{ inputs.target_ref }}
+          path: target-repository
+          token: ${{ github.token }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+
+      - name: Static target precheck (free, read-only)
+        id: static
+        uses: ./costdoctor-engine
+        with:
+          repository: "./target-repository"
+
+      - name: Bind target and derive sanitized provider/workload evidence
+        shell: bash
+        env:
+          STATIC_REPORT_DIR: ${{ steps.static.outputs.report-directory }}
+        run: |
+          set -euo pipefail
+          python3 costdoctor-engine/universal/scripts/run_target_bound_precheck.py \
+            --repository target-repository \
+            --target-repository "${{ inputs.target_repository }}" \
+            --target-ref "${{ inputs.target_ref }}" \
+            --static-report "$STATIC_REPORT_DIR/report.json" \
+            --output "$RUNNER_TEMP/costdoctor-target-binding.json"
+
+      - name: Existing OpenAI benchmark (ENGINE_SELF_TEST / PROVIDER_REFERENCE only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 costdoctor-engine/universal/scripts/run_optimizer_acceptance.py \
+            --output "$RUNNER_TEMP/costdoctor-optimizer" \
+            --commit "${GITHUB_SHA}" \
+            --run-label engine-self-test-provider-reference
+
+      - name: Universal provider preflight (no network call)
+        shell: bash
+        env:
+          COSTDOCTOR_PROVIDER_SECRET_SOURCE: TARGET_REPOSITORY_GITHUB_SECRET
+        run: |
+          set -euo pipefail
+          python3 costdoctor-engine/universal/scripts/run_universal_provider_preflight.py \
+            --target-binding "$RUNNER_TEMP/costdoctor-target-binding.json" \
+            --output "$RUNNER_TEMP/costdoctor-target-provider-preflight/preflight.json" \
+            --approved-max-spend-usd "${{ inputs.approved_max_spend_usd }}"
+
+      - name: Optional Provider A/B/C actual (target Secret + exact confirmation only)
+        if: ${{ inputs.execute_confirmation == 'PROVIDER_PAID_EXECUTION_APPROVED' }}
+        continue-on-error: true
+        env:
+          COSTDOCTOR_PROVIDER_SECRET: ${{ secrets[inputs.provider_secret_name] }}
+          COSTDOCTOR_PROVIDER_SECRET_SOURCE: TARGET_REPOSITORY_GITHUB_SECRET
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${COSTDOCTOR_PROVIDER_SECRET:-}" ]; then
+            echo "PROVIDER_SECRET_OPTIONAL_NOT_PRESENT"
+            exit 0
+          fi
+          python3 costdoctor-engine/universal/scripts/run_provider_abc.py \
+            --target-repository target-repository \
+            --target-binding "$RUNNER_TEMP/costdoctor-target-binding.json" \
+            --output "$RUNNER_TEMP/costdoctor-target-provider-actual" \
+            --execute-confirmation "${{ inputs.execute_confirmation }}" \
+            --approved-max-spend-usd "${{ inputs.approved_max_spend_usd }}" \
+            --secret-env COSTDOCTOR_PROVIDER_SECRET
+
+      - name: Build universal Stage 2 sanitized user report
+        shell: bash
+        env:
+          STATIC_REPORT_DIR: ${{ steps.static.outputs.report-directory }}
+        run: |
+          set -euo pipefail
+          python3 costdoctor-engine/universal/scripts/build_public_verified_savings_report.py \
+            --static-report "$STATIC_REPORT_DIR/report.json" \
+            --optimizer-dir "$RUNNER_TEMP/costdoctor-optimizer" \
+            --provider-preflight "$RUNNER_TEMP/costdoctor-target-provider-preflight/preflight.json" \
+            --provider-result "$RUNNER_TEMP/costdoctor-target-provider-actual/provider_abc_result.json" \
+            --target-binding "$RUNNER_TEMP/costdoctor-target-binding.json" \
+            --target-precheck "$RUNNER_TEMP/costdoctor-target-binding.json" \
+            --output "$RUNNER_TEMP/costdoctor-verified-report"
+
+      - name: Show universal Stage 2 report in job summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$RUNNER_TEMP/costdoctor-verified-report/verified_savings_report.md" ]; then
+            cat "$RUNNER_TEMP/costdoctor-verified-report/verified_savings_report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Stage 2 report unavailable; inspect the sanitized artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep sanitized universal Stage 2 evidence briefly
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6 (Node24)
+        with:
+          name: costdoctor-universal-stage2
+          path: |
+            ${{ runner.temp }}/costdoctor-verified-report/verified_savings_report.json
+            ${{ runner.temp }}/costdoctor-verified-report/verified_savings_report.md
+            ${{ runner.temp }}/costdoctor-target-binding.json
+            ${{ runner.temp }}/costdoctor-target-provider-preflight/preflight.json
+          if-no-files-found: error
+          retention-days: 1
